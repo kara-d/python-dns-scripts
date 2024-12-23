@@ -1,5 +1,7 @@
 import subprocess
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from ipaddress import ip_address
 
 # Function to perform dig and extract DNS records and DNSSEC status
 def dig_lookup(ip):
@@ -70,6 +72,23 @@ def whois_lookup(ip):
 
     return results
 
+# Function to find ASN using whois
+def find_asn(ip):
+    try:
+        asn_result = subprocess.run(
+            ["whois", "-h", "whois.cymru.com", f" -v {ip}"],
+            capture_output=True,
+            text=True
+        )
+        # Parse ASN from the output
+        lines = asn_result.stdout.splitlines()
+        if len(lines) > 1:
+            return lines[1].split('|')[0].strip()
+        else:
+            return "N/A"
+    except Exception as e:
+        return f"Error: {e}"
+
 # Function to ping the IP address
 def ping_host(ip):
     try:
@@ -85,71 +104,74 @@ def ping_host(ip):
     except Exception as e:
         return f"Error: {e}"
 
-# Function to generate quad IPs and perform lookups
-def find_quads_and_lookup():
-    quads = []
-    # Loop through all /8 blocks
-    for i in range(1, 255):  # Range from 1 to 254
-        quad_ip = f"{i}.{i}.{i}.{i}"
-        print(f"Processing: {quad_ip}")  # Output progress to terminal
-        dns_results = dig_lookup(quad_ip)
-        whois_results = whois_lookup(quad_ip)
-        host_status = ping_host(quad_ip)
+# Function to process a single IP address
+def process_ip(ip):
+    print(f"Processing: {ip}")  # Output progress to terminal
+    dns_results = dig_lookup(ip)
+    whois_results = whois_lookup(ip)
+    asn = find_asn(ip)
+    host_status = ping_host(ip)
 
-        quad_data = {
-            "IP": quad_ip,
-            "A": dns_results["A"],
-            "TXT": dns_results["TXT"],
-            "DNSSEC": dns_results["DNSSEC"],
-            "Owner": whois_results["Owner"],
-            "Registrar": whois_results["Registrar"],
-            "Registry": whois_results["Registry"],
-            "Status": host_status,
-        }
-        quads.append(quad_data)
+    return {
+        "IP": ip,
+        "A": dns_results["A"],
+        "TXT": dns_results["TXT"],
+        "DNSSEC": dns_results["DNSSEC"],
+        "Owner": whois_results["Owner"],
+        "Registrar": whois_results["Registrar"],
+        "Registry": whois_results["Registry"],
+        "ASN": asn,
+        "Status": host_status,
+    }
 
-    return quads
-
-# Write results to CSV
+# Function to write results to CSV
 def write_to_csv(filename, data):
     with open(filename, "w", newline="") as csvfile:
-        fieldnames = ["IP", "A", "TXT", "DNSSEC", "Owner", "Registrar", "Registry", "Status"]
+        fieldnames = ["IP", "A", "TXT", "DNSSEC", "Owner", "Registrar", "Registry", "ASN", "Status"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for row in data:
             writer.writerow(row)
 
-# Write results to Markdown table
+# Function to write results to Markdown
 def write_to_markdown(filename, data):
     with open(filename, "w") as mdfile:
         # Write the table header
-        mdfile.write("| IP Address | A Record | TXT Record | DNSSEC | Owner | Registrar | Registry | Status |\n")
-        mdfile.write("|------------|----------|------------|--------|-------|-----------|----------|--------|\n")
+        mdfile.write("| IP Address | A Record | TXT Record | DNSSEC | Owner | Registrar | Registry | ASN | Status |\n")
+        mdfile.write("|------------|----------|------------|--------|-------|-----------|----------|-----|--------|\n")
         # Write each row
         for row in data:
             mdfile.write(f"| {row['IP']} | {row['A']} | {row['TXT']} | {row['DNSSEC']} | "
-                         f"{row['Owner']} | {row['Registrar']} | {row['Registry']} | {row['Status']} |\n")
+                         f"{row['Owner']} | {row['Registrar']} | {row['Registry']} | {row['ASN']} | {row['Status']} |\n")
 
-# Main function
+# Main function with parallel processing
 def main():
     output_csv = "quads.csv"
     output_md = "quads.md"
-    print("Finding quad IPs and performing DNS, WHOIS lookups, and ping tests...")
-    quads = find_quads_and_lookup()
-    
-    # Output to terminal
-    for quad in quads:
-        print(
-            f"IP: {quad['IP']}, A: {quad['A']}, TXT: {quad['TXT']}, DNSSEC: {quad['DNSSEC']}, "
-            f"Owner: {quad['Owner']}, Registrar: {quad['Registrar']}, "
-            f"Registry: {quad['Registry']}, Status: {quad['Status']}"
-        )
+    ips = [f"{i}.{i}.{i}.{i}" for i in range(1, 255)]  # Generate quad IPs
+    results = []
+
+    print("Finding quad IPs and performing DNS, WHOIS lookups, ASN lookups, and ping tests in parallel...")
+
+    # Process IPs in parallel with a limit of 10 threads
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_ip = {executor.submit(process_ip, ip): ip for ip in ips}
+        for future in as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                print(f"Error processing {ip}: {e}")
+
+    # Sort results by numerical IP order
+    results.sort(key=lambda x: ip_address(x["IP"]))
 
     # Write results to files
     print(f"Writing results to {output_csv}...")
-    write_to_csv(output_csv, quads)
+    write_to_csv(output_csv, results)
     print(f"Writing results to {output_md}...")
-    write_to_markdown(output_md, quads)
+    write_to_markdown(output_md, results)
     print("Done!")
 
 if __name__ == "__main__":
